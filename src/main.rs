@@ -13,13 +13,50 @@ use heapless::{
 };
 
 struct ActorMessage<A: Actor + 'static> {
-    signal: &'static Signal<A::Response>,
+    signal: &'static SignalSlot<A::Response>,
     request: A::Request,
 }
 
 impl<A: Actor> ActorMessage<A> {
-    pub fn new(request: A::Request, signal: &'static Signal<A::Response>) -> Self {
+    pub fn new(request: A::Request, signal: &'static SignalSlot<A::Response>) -> Self {
         Self { request, signal }
+    }
+}
+
+struct SignalSlot<T: Sized> {
+    free: AtomicBool,
+    signal: Signal<T>,
+}
+
+impl<T> SignalSlot<T> {
+    fn acquire(&self) -> bool {
+        if self.free.swap(false, Ordering::AcqRel) {
+            self.signal.reset();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn poll_wait(&self, cx: &mut Context<'_>) -> Poll<T> {
+        self.signal.poll_wait(cx)
+    }
+
+    pub fn signal(&self, val: T) {
+        self.signal.signal(val)
+    }
+
+    fn release(&self) {
+        self.free.store(true, Ordering::Release)
+    }
+}
+
+impl<T: Sized> Default for SignalSlot<T> {
+    fn default() -> Self {
+        Self {
+            free: AtomicBool::new(true),
+            signal: Signal::new(),
+        }
     }
 }
 
@@ -93,7 +130,7 @@ struct ActorRunner<A: Actor + 'static> {
     state: AtomicU8,
     in_flight: AtomicBool,
 
-    signals: UnsafeCell<[(AtomicBool, Signal<A::Response>); 2]>,
+    signals: UnsafeCell<[SignalSlot<A::Response>; 2]>,
     requests: UnsafeCell<Queue<ActorMessage<A>, consts::U2>>,
 
     context: ActorContext<A>,
@@ -106,10 +143,7 @@ impl<A: Actor> ActorRunner<A> {
             current: RefCell::new(None),
             state: AtomicU8::new(ActorState::READY.into()),
             in_flight: AtomicBool::new(false),
-            signals: UnsafeCell::new([
-                (AtomicBool::new(false), Signal::new()),
-                (AtomicBool::new(false), Signal::new()),
-            ]),
+            signals: UnsafeCell::new(Default::default()),
 
             requests: UnsafeCell::new(Queue::new()),
 
@@ -134,12 +168,12 @@ impl<A: Actor> ActorRunner<A> {
         self.state.fetch_sub(1, Ordering::Acquire);
     }
 
-    fn acquire_signal(&'static self) -> &'static Signal<A::Response> {
+    fn acquire_signal(&'static self) -> &'static SignalSlot<A::Response> {
         let mut signals = unsafe { (&mut *self.signals.get()) };
         let mut i = 0;
         while i < signals.len() {
-            if !signals[i].0.swap(true, Ordering::AcqRel) {
-                return &signals[i].1;
+            if signals[i].acquire() {
+                return &signals[i];
             }
             i += 1;
         }
@@ -148,7 +182,6 @@ impl<A: Actor> ActorRunner<A> {
 
     fn do_request(&'static self, request: A::Request) -> ActorResponseFuture<A> {
         let signal = self.acquire_signal();
-        signal.reset();
         let message = ActorMessage::new(request, signal);
         self.context.enqueue_request(message);
         self.state.store(ActorState::READY.into(), Ordering::SeqCst);
@@ -181,11 +214,11 @@ impl<A: Actor> Address<A> {
 }
 
 struct ActorResponseFuture<A: Actor + 'static> {
-    signal: &'static Signal<A::Response>,
+    signal: &'static SignalSlot<A::Response>,
 }
 
 impl<A: Actor> ActorResponseFuture<A> {
-    pub fn new(signal: &'static Signal<A::Response>) -> Self {
+    pub fn new(signal: &'static SignalSlot<A::Response>) -> Self {
         Self { signal }
     }
 }
