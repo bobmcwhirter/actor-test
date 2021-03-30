@@ -1,3 +1,5 @@
+#![no_main]
+#![no_std]
 use core::cell::{RefCell, UnsafeCell};
 use core::fmt::Debug;
 use core::future::Future;
@@ -5,12 +7,15 @@ use core::mem;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-use futures::executor::block_on;
+use cortex_m_rt::{entry, exception};
 use heapless::{
     consts,
     spsc::{Consumer, Producer, Queue},
     Vec,
 };
+use panic_reset as _;
+
+use nrf52833_hal as hal;
 
 struct ActorMessage<A: Actor + 'static> {
     signal: &'static SignalSlot<A::Response>,
@@ -65,8 +70,6 @@ impl<T: Sized> Default for SignalSlot<T> {
     fn into(self) -> Self;
     fn from<T>(message: Self) -> T;
 }*/
-
-use std::sync::Mutex;
 
 trait Actor: Sized {
     type Configuration;
@@ -237,7 +240,7 @@ impl<A: Actor> ActiveActor for ActorRunner<A> {
     }
 
     fn do_poll(&'static self) {
-        println!("Running self");
+        log::info!("Running self");
         loop {
             if self.current.borrow().is_none() {
                 if let Some(next) = self.context.next_request() {
@@ -257,7 +260,7 @@ impl<A: Actor> ActiveActor for ActorRunner<A> {
                 let waker = unsafe { Waker::from_raw(raw_waker) };
                 let mut cx = Context::from_waker(&waker);
 
-                println!("Polling future");
+                log::info!("Polling future");
                 let item = Pin::new(item);
                 let result = item.poll(&mut cx);
                 match result {
@@ -404,7 +407,8 @@ static VTABLE: RawWakerVTable = {
     RawWakerVTable::new(clone, wake, wake_by_ref, drop)
 };
 
-fn main() {
+#[entry]
+fn main() -> ! {
     let mut executor = ActorExecutor::new();
     let foo_runner = ActorRunner::new(MyActor::new("foo"));
     let bar_runner = ActorRunner::new(MyActor::new("bar"));
@@ -419,13 +423,10 @@ fn main() {
     foo_runner.mount(bar_addr, &mut executor);
     bar_runner.mount(foo_addr, &mut executor);
 
-    std::thread::spawn(move || {
-        executor.run_forever();
-    });
+    // Trigger running
+    foo_addr.request(1);
 
-    // Cheat and use other executor for the test
-    println!("Foo result: {}", block_on(foo_addr.request(1)));
-    println!("Bar result: {}", block_on(bar_addr.request(2)));
+    executor.run_forever();
 }
 
 struct MyActor {
@@ -446,7 +447,7 @@ impl Actor for MyActor {
 
     fn mount(&mut self, config: Self::Configuration) {
         self.other.replace(config);
-        println!("[{}] mounted!", self.name);
+        log::info!("[{}] mounted!", self.name);
     }
 
     fn poll_request(
@@ -454,14 +455,14 @@ impl Actor for MyActor {
         request: &Self::Request,
         cx: &mut Context<'_>,
     ) -> Poll<Self::Response> {
-        println!("[{}] processing request: {}", self.name, request);
+        log::info!("[{}] processing request: {}", self.name, request);
         Poll::Ready(*request + 1)
     }
 }
 
 pub struct Signal<T> {
     state: UnsafeCell<State<T>>,
-    lock: std::sync::Mutex<()>,
+    locked: AtomicBool,
 }
 
 enum State<T> {
@@ -477,7 +478,7 @@ impl<T: Sized> Signal<T> {
     pub fn new() -> Self {
         Self {
             state: UnsafeCell::new(State::None),
-            lock: std::sync::Mutex::new(()),
+            locked: AtomicBool::new(false),
         }
     }
 
@@ -485,8 +486,10 @@ impl<T: Sized> Signal<T> {
     where
         F: FnOnce() -> R,
     {
-        let guard = self.lock.lock().unwrap();
-        f()
+        while self.locked.swap(true, Ordering::AcqRel) {}
+        let r = f();
+        self.locked.store(false, Ordering::AcqRel);
+        r
     }
 
     #[allow(clippy::single_match)]
@@ -535,3 +538,6 @@ impl<T: Sized> Default for Signal<T> {
         Self::new()
     }
 }
+
+#[exception]
+fn DefaultHandler(irqn: i16) {}

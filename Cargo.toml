@@ -6,4 +6,17 @@ edition = "2018"
 
 [dependencies]
 heapless = "0.6"
-futures = { version = "0.3", features = ["executor"]}
+log = "0.4"
+cortex-m = "0.6"
+cortex-m-rt = { version = "0.6", features = ["device"] }
+panic-reset = "0.1"
+
+[dependencies.nrf52833-hal]
+git = "https://github.com/lulf/nrf-hal.git"
+branch = "uarte-embedded-serial"
+features = ["rt"]
+
+[profile.release]
+debug = true
+opt-level = "z"
+lto = true
