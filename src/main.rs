@@ -12,14 +12,15 @@ use heapless::{
     Vec,
 };
 
-struct ActorMessage<A: Actor + 'static> {
-    signal: &'static SignalSlot,
-    inner: UnsafeCell<* mut A::Message>,
+struct ActorMessage<A: Actor> {
+    //signal: &'static SignalSlot,
+    signal: UnsafeCell<*const SignalSlot>,
+    inner: UnsafeCell<*mut A::Message>,
 }
 
 impl<A: Actor> ActorMessage<A> {
-    pub fn new(message: &mut A::Message, signal: &'static SignalSlot) -> Self {
-        Self { inner: UnsafeCell::new(message), signal }
+    pub fn new(message: &mut A::Message, signal: &SignalSlot) -> Self {
+        Self { inner: UnsafeCell::new(message), signal: UnsafeCell::new(signal) }
     }
 }
 
@@ -68,6 +69,7 @@ impl Default for SignalSlot {
 
 use std::sync::Mutex;
 use std::time::{SystemTime, Duration};
+use std::marker::PhantomData;
 
 trait Actor: Sized {
     type Configuration;
@@ -168,8 +170,8 @@ impl<A: Actor> ActorRunner<A> {
         self.state.fetch_sub(1, Ordering::Acquire);
     }
 
-    fn acquire_signal(&'static self) -> &'static SignalSlot {
-        let mut signals = unsafe { (&mut *self.signals.get()) };
+    fn acquire_signal(&self) -> &SignalSlot {
+        let mut signals = unsafe { &mut *self.signals.get() };
         let mut i = 0;
         while i < signals.len() {
             if signals[i].acquire() {
@@ -180,7 +182,7 @@ impl<A: Actor> ActorRunner<A> {
         panic!("not enough signals!");
     }
 
-    fn process_message(&'static self, message: &mut A::Message) -> ActorResponseFuture {
+    fn process_message<'s, 'm>(&'s self, message: &'m mut A::Message) -> ActorResponseFuture<'s, 'm> {
         let signal = self.acquire_signal();
         let message = ActorMessage::new(message, signal);
         self.context.enqueue_message(message);
@@ -213,17 +215,21 @@ impl<A: Actor> Address<A> {
     }
 }
 
-struct ActorResponseFuture {
-    signal: &'static SignalSlot,
+struct ActorResponseFuture<'s, 'm> {
+    signal: &'s SignalSlot,
+    _marker: PhantomData<&'m ()>,
 }
 
-impl ActorResponseFuture {
-    pub fn new(signal: &'static SignalSlot) -> Self {
-        Self { signal }
+impl<'s> ActorResponseFuture<'s, '_> {
+    pub fn new(signal: &'s SignalSlot) -> Self {
+        Self {
+            signal,
+            _marker: PhantomData,
+        }
     }
 }
 
-impl Future for ActorResponseFuture {
+impl Future for ActorResponseFuture<'_, '_> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -308,7 +314,7 @@ impl<A: Actor> Future for ActorRequestFuture<A> {
             .poll_message(unsafe { &mut **self.message.inner.get() }, cx)
         {
             Poll::Ready(()) => {
-                self.message.signal.signal();
+                unsafe { &**self.message.signal.get() }.signal();
                 Poll::Ready(())
             }
             Poll::Pending => Poll::Pending,
@@ -430,8 +436,8 @@ fn main() {
     let foo_fut = foo_addr.process(&mut foo_req);
     let bar_fut = bar_addr.process(&mut bar_req);
 
-    block_on(foo_fut );
-    block_on(bar_fut );
+    block_on(foo_fut);
+    block_on(bar_fut);
     // Cheat and use other executor for the test
     println!("Foo result: {:?}", foo_req);
     println!("Bar result: {:?}", bar_req);
@@ -486,13 +492,13 @@ impl Actor for MyActor {
         match message.started_at {
             None => {
                 println!("[{}] delaying request: {:?}", self.name, message);
-                message.started_at.replace( SystemTime::now() );
+                message.started_at.replace(SystemTime::now());
                 let waker = cx.waker().clone();
                 let delay = message.delay;
                 let name = self.name;
-                std::thread::spawn( move || {
+                std::thread::spawn(move || {
                     println!("[{}] sleeping for {}", name, delay);
-                    std::thread::sleep( Duration::from_secs( delay as u64) );
+                    std::thread::sleep(Duration::from_secs(delay as u64));
                     println!("[{}] waking for {}", name, delay);
                     waker.wake();
                 });
@@ -501,9 +507,9 @@ impl Actor for MyActor {
             Some(time) => {
                 if let Ok(elapsed) = time.elapsed() {
                     println!("[{}] woken after {:?}", self.name, elapsed.as_secs());
-                    if elapsed.as_secs() >= message.delay as u64{
+                    if elapsed.as_secs() >= message.delay as u64 {
                         println!("[{}] completed request: {:?}", self.name, message);
-                        return Poll::Ready(())
+                        return Poll::Ready(());
                     }
                 }
                 println!("[{}] still pending", self.name);
@@ -540,7 +546,7 @@ impl Signal {
         where
             F: FnOnce() -> R,
     {
-        let guard = self.lock.lock().unwrap();
+        let _guard = self.lock.lock().unwrap();
         f()
     }
 
