@@ -13,7 +13,6 @@ use heapless::{
 };
 
 struct ActorMessage<A: Actor> {
-    //signal: &'static SignalSlot,
     signal: UnsafeCell<*const SignalSlot>,
     inner: UnsafeCell<*mut A::Message>,
 }
@@ -83,7 +82,7 @@ trait Actor: Sized {
     ) -> Poll<()>;
 }
 
-struct ActorContext<A: Actor + 'static> {
+struct ActorContext<A: Actor> {
     message_producer: RefCell<Option<Producer<'static, ActorMessage<A>, consts::U2>>>,
     message_consumer: RefCell<Option<Consumer<'static, ActorMessage<A>, consts::U2>>>,
 }
@@ -125,9 +124,8 @@ impl<A: Actor> ActorContext<A> {
     }
 }
 
-struct ActorRunner<A: Actor + 'static> {
+struct ActorRunner<A: Actor> {
     actor: RefCell<Option<A>>,
-    //current: RefCell<Option<ActorRequestFuture<A>>>,
     current: RefCell<Option<ActorMessage<A>>>,
 
     state: AtomicU8,
@@ -192,13 +190,13 @@ impl<A: Actor> ActorRunner<A> {
     }
 }
 
-struct Address<A: Actor + 'static> {
-    runner: &'static ActorRunner<A>,
+struct Address<'a, A: Actor> {
+    runner: &'a ActorRunner<A>,
 }
 
-impl<A: Actor> Copy for Address<A> {}
+impl<A: Actor> Copy for Address<'_, A> {}
 
-impl<A: Actor> Clone for Address<A> {
+impl<A: Actor> Clone for Address<'_, A> {
     fn clone(&self) -> Self {
         Self {
             runner: self.runner,
@@ -206,8 +204,8 @@ impl<A: Actor> Clone for Address<A> {
     }
 }
 
-impl<A: Actor> Address<A> {
-    fn new(runner: &'static ActorRunner<A>) -> Self {
+impl<'a, A: Actor> Address<'a, A> {
+    fn new(runner: &'a ActorRunner<A>) -> Self {
         Self { runner }
     }
 
@@ -243,7 +241,7 @@ impl<A: Actor> ActiveActor for ActorRunner<A> {
         self.state.load(Ordering::Acquire) >= ActorState::READY as u8
     }
 
-    fn do_poll(&'static self) {
+    fn do_poll(&self) {
         println!("[ActiveActor] do_poll()");
         if self.current.borrow().is_none() {
             if let Some(next) = self.context.next_message() {
@@ -274,11 +272,10 @@ impl<A: Actor> ActiveActor for ActorRunner<A> {
     }
 }
 
-unsafe impl Send for Supervised {}
+unsafe impl Send for Supervised<'_> {}
 
-
-pub struct ActorExecutor {
-    actors: Vec<Supervised, consts::U16>,
+pub struct ActorExecutor<'a> {
+    actors: Vec<Supervised<'a>, consts::U16>,
 }
 
 #[derive(PartialEq)]
@@ -293,17 +290,17 @@ impl Into<u8> for ActorState {
     }
 }
 
-struct Supervised {
-    actor: &'static dyn ActiveActor,
+struct Supervised<'a> {
+    actor: &'a dyn ActiveActor,
 }
 
 trait ActiveActor {
     fn is_ready(&self) -> bool;
-    fn do_poll(&'static self);
+    fn do_poll(&self);
 }
 
-impl Supervised {
-    fn new<A: Actor>(actor: &'static ActorRunner<A>) -> Self {
+impl<'a> Supervised<'a> {
+    fn new<A: Actor>(actor: &'a ActorRunner<A>) -> Self {
         Self { actor }
     }
 
@@ -317,12 +314,12 @@ impl Supervised {
     }
 }
 
-impl ActorExecutor {
+impl<'a> ActorExecutor<'a> {
     pub(crate) fn new() -> Self {
         Self { actors: Vec::new() }
     }
 
-    pub(crate) fn activate_actor<A: Actor>(&mut self, actor: &'static ActorRunner<A>) {
+    pub(crate) fn activate_actor<A: Actor>(&mut self, actor: &'a ActorRunner<A>) {
         let supervised = Supervised::new(actor);
         self.actors
             .push(supervised)
@@ -402,12 +399,12 @@ fn main() {
     println!("Bar result: {:?}", bar_req);
 }
 
-struct MyActor {
+struct MyActor<'c> {
     name: &'static str,
-    other: Option<Address<MyActor>>,
+    other: Option<Address<'c, MyActor<'c>>>,
 }
 
-impl MyActor {
+impl<'a> MyActor<'a> {
     pub fn new(name: &'static str) -> Self {
         Self { name, other: None }
     }
@@ -434,9 +431,9 @@ impl MyMessage {
     }
 }
 
-impl Actor for MyActor {
+impl<'c> Actor for MyActor<'c> {
     type Message = MyMessage;
-    type Configuration = Address<MyActor>;
+    type Configuration = Address<'c, MyActor<'c>>;
 
     fn mount(&mut self, config: Self::Configuration) {
         self.other.replace(config);
