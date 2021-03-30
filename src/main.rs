@@ -12,13 +12,13 @@ use heapless::{
     Vec,
 };
 
-struct ActorMessage<A: Actor> {
-    signal: Signal<A::Response>,
+struct ActorMessage<A: Actor + 'static> {
+    signal: &'static Signal<A::Response>,
     request: A::Request,
 }
 
 impl<A: Actor> ActorMessage<A> {
-    pub fn new(request: A::Request, signal: Signal<A::Response>) -> Self {
+    pub fn new(request: A::Request, signal: &'static Signal<A::Response>) -> Self {
         Self { request, signal }
     }
 }
@@ -44,7 +44,7 @@ trait Actor: Sized {
     ) -> Poll<Self::Response>;
 }
 
-struct ActorContext<A: Actor> {
+struct ActorContext<A: Actor + 'static> {
     request_producer: RefCell<Option<Producer<'static, ActorMessage<A>, consts::U2>>>,
     request_consumer: RefCell<Option<Consumer<'static, ActorMessage<A>, consts::U2>>>,
 }
@@ -93,6 +93,7 @@ struct ActorRunner<A: Actor + 'static> {
     state: AtomicU8,
     in_flight: AtomicBool,
 
+    signals: UnsafeCell<[(bool, Signal<A::Response>); 2]>,
     requests: UnsafeCell<Queue<ActorMessage<A>, consts::U2>>,
 
     context: ActorContext<A>,
@@ -105,6 +106,7 @@ impl<A: Actor> ActorRunner<A> {
             current: RefCell::new(None),
             state: AtomicU8::new(ActorState::READY.into()),
             in_flight: AtomicBool::new(false),
+            signals: UnsafeCell::new([(false, Signal::new()), (false, Signal::new())]),
 
             requests: UnsafeCell::new(Queue::new()),
 
@@ -129,8 +131,22 @@ impl<A: Actor> ActorRunner<A> {
         self.state.fetch_sub(1, Ordering::Acquire);
     }
 
+    fn acquire_signal(&'static self) -> &'static Signal<A::Response> {
+        let mut signals = unsafe { (&mut *self.signals.get()) };
+        let mut i = 0;
+        while i < signals.len() {
+            // TODO: Atomic operation to ensure mutual exclusion
+            if !signals[i].0 {
+                signals[i].0 = true;
+                return &signals[i].1;
+            }
+            i += 1;
+        }
+        panic!("not enough signals!");
+    }
+
     fn do_request(&'static self, request: A::Request) -> ActorResponseFuture<A> {
-        let signal = Signal::new();
+        let signal = self.acquire_signal();
         let message = ActorMessage::new(request, signal);
         self.context.enqueue_request(message);
         self.state.store(ActorState::READY.into(), Ordering::SeqCst);
@@ -163,11 +179,11 @@ impl<A: Actor> Address<A> {
 }
 
 struct ActorResponseFuture<A: Actor + 'static> {
-    signal: Signal<A::Response>,
+    signal: &'static Signal<A::Response>,
 }
 
 impl<A: Actor> ActorResponseFuture<A> {
-    pub fn new(signal: Signal<A::Response>) -> Self {
+    pub fn new(signal: &'static Signal<A::Response>) -> Self {
         Self { signal }
     }
 }
