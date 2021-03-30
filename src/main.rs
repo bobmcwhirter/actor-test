@@ -13,22 +13,22 @@ use heapless::{
 };
 
 struct ActorMessage<A: Actor + 'static> {
-    signal: &'static SignalSlot<A::Response>,
-    request: A::Request,
+    signal: &'static SignalSlot,
+    request: UnsafeCell<* mut A::Request>,
 }
 
 impl<A: Actor> ActorMessage<A> {
-    pub fn new(request: A::Request, signal: &'static SignalSlot<A::Response>) -> Self {
-        Self { request, signal }
+    pub fn new(request: &mut A::Request, signal: &'static SignalSlot) -> Self {
+        Self { request: UnsafeCell::new(request), signal }
     }
 }
 
-struct SignalSlot<T: Sized> {
+struct SignalSlot {
     free: AtomicBool,
-    signal: Signal<T>,
+    signal: Signal,
 }
 
-impl<T> SignalSlot<T> {
+impl SignalSlot {
     fn acquire(&self) -> bool {
         if self.free.swap(false, Ordering::AcqRel) {
             self.signal.reset();
@@ -38,12 +38,12 @@ impl<T> SignalSlot<T> {
         }
     }
 
-    pub fn poll_wait(&self, cx: &mut Context<'_>) -> Poll<T> {
+    pub fn poll_wait(&self, cx: &mut Context<'_>) -> Poll<()> {
         self.signal.poll_wait(cx)
     }
 
-    pub fn signal(&self, val: T) {
-        self.signal.signal(val)
+    pub fn signal(&self) {
+        self.signal.signal()
     }
 
     fn release(&self) {
@@ -51,7 +51,7 @@ impl<T> SignalSlot<T> {
     }
 }
 
-impl<T: Sized> Default for SignalSlot<T> {
+impl Default for SignalSlot {
     fn default() -> Self {
         Self {
             free: AtomicBool::new(true),
@@ -71,14 +71,13 @@ use std::sync::Mutex;
 trait Actor: Sized {
     type Configuration;
     type Request: Debug;
-    type Response: Debug;
 
     fn mount(&mut self, _: Self::Configuration);
     fn poll_request(
         &mut self,
-        request: &Self::Request,
+        request: &mut Self::Request,
         cx: &mut Context<'_>,
-    ) -> Poll<Self::Response>;
+    ) -> Poll<()>;
 }
 
 struct ActorContext<A: Actor + 'static> {
@@ -130,7 +129,7 @@ struct ActorRunner<A: Actor + 'static> {
     state: AtomicU8,
     in_flight: AtomicBool,
 
-    signals: UnsafeCell<[SignalSlot<A::Response>; 2]>,
+    signals: UnsafeCell<[SignalSlot; 2]>,
     requests: UnsafeCell<Queue<ActorMessage<A>, consts::U2>>,
 
     context: ActorContext<A>,
@@ -168,7 +167,7 @@ impl<A: Actor> ActorRunner<A> {
         self.state.fetch_sub(1, Ordering::Acquire);
     }
 
-    fn acquire_signal(&'static self) -> &'static SignalSlot<A::Response> {
+    fn acquire_signal(&'static self) -> &'static SignalSlot {
         let mut signals = unsafe { (&mut *self.signals.get()) };
         let mut i = 0;
         while i < signals.len() {
@@ -180,7 +179,7 @@ impl<A: Actor> ActorRunner<A> {
         panic!("not enough signals!");
     }
 
-    fn do_request(&'static self, request: A::Request) -> ActorResponseFuture<A> {
+    fn do_request(&'static self, request: &mut A::Request) -> ActorResponseFuture {
         let signal = self.acquire_signal();
         let message = ActorMessage::new(request, signal);
         self.context.enqueue_request(message);
@@ -208,23 +207,23 @@ impl<A: Actor> Address<A> {
         Self { runner }
     }
 
-    async fn request(&self, request: A::Request) -> A::Response {
+    async fn request(&self, request: &mut A::Request) {
         self.runner.do_request(request).await
     }
 }
 
-struct ActorResponseFuture<A: Actor + 'static> {
-    signal: &'static SignalSlot<A::Response>,
+struct ActorResponseFuture {
+    signal: &'static SignalSlot,
 }
 
-impl<A: Actor> ActorResponseFuture<A> {
-    pub fn new(signal: &'static SignalSlot<A::Response>) -> Self {
+impl ActorResponseFuture {
+    pub fn new(signal: &'static SignalSlot) -> Self {
         Self { signal }
     }
 }
 
-impl<A: Actor> Future for ActorResponseFuture<A> {
-    type Output = A::Response;
+impl Future for ActorResponseFuture {
+    type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.signal.poll_wait(cx)
@@ -286,6 +285,7 @@ struct ActorRequestFuture<A: Actor + 'static> {
 }
 
 impl<A: Actor> Unpin for ActorRequestFuture<A> {}
+
 unsafe impl Send for Supervised {}
 
 impl<A: Actor> ActorRequestFuture<A> {
@@ -304,10 +304,10 @@ impl<A: Actor> Future for ActorRequestFuture<A> {
             .borrow_mut()
             .as_mut()
             .unwrap()
-            .poll_request(&self.message.request, cx)
+            .poll_request(unsafe { &mut **self.message.request.get() }, cx)
         {
-            Poll::Ready(value) => {
-                self.message.signal.signal(value);
+            Poll::Ready(()) => {
+                self.message.signal.signal();
                 Poll::Ready(())
             }
             Poll::Pending => Poll::Pending,
@@ -423,9 +423,14 @@ fn main() {
         executor.run_forever();
     });
 
+    let mut foo_req = MyRequest::new(1, 2);
+    let mut bar_req = MyRequest::new(3, 4);
+
+    block_on(foo_addr.request(&mut foo_req));
+    block_on(bar_addr.request(&mut bar_req));
     // Cheat and use other executor for the test
-    println!("Foo result: {}", block_on(foo_addr.request(1)));
-    println!("Bar result: {}", block_on(bar_addr.request(2)));
+    println!("Foo result: {:?}", foo_req);
+    println!("Bar result: {:?}", bar_req);
 }
 
 struct MyActor {
@@ -439,9 +444,25 @@ impl MyActor {
     }
 }
 
+#[derive(Debug)]
+pub struct MyRequest {
+    pub a: u8,
+    pub b: u8,
+    pub c: Option<u8>,
+}
+
+impl MyRequest {
+    pub fn new(a: u8, b: u8) -> Self {
+        Self {
+            a,
+            b,
+            c: None,
+        }
+    }
+}
+
 impl Actor for MyActor {
-    type Request = u8;
-    type Response = u8;
+    type Request = MyRequest;
     type Configuration = Address<MyActor>;
 
     fn mount(&mut self, config: Self::Configuration) {
@@ -451,29 +472,31 @@ impl Actor for MyActor {
 
     fn poll_request(
         &mut self,
-        request: &Self::Request,
+        request: &mut Self::Request,
         cx: &mut Context<'_>,
-    ) -> Poll<Self::Response> {
-        println!("[{}] processing request: {}", self.name, request);
-        Poll::Ready(*request + 1)
+    ) -> Poll<()> {
+        println!("[{}] processing request: {:?}", self.name, request);
+        request.c.replace( request.a + request.b );
+        Poll::Ready(())
     }
 }
 
-pub struct Signal<T> {
-    state: UnsafeCell<State<T>>,
+pub struct Signal {
+    state: UnsafeCell<State>,
     lock: std::sync::Mutex<()>,
 }
 
-enum State<T> {
+enum State {
     None,
     Waiting(Waker),
-    Signaled(T),
+    Signaled,
 }
 
-unsafe impl<T: Sized> Send for Signal<T> {}
-unsafe impl<T: Sized> Sync for Signal<T> {}
+unsafe impl Send for Signal {}
 
-impl<T: Sized> Signal<T> {
+unsafe impl Sync for Signal {}
+
+impl Signal {
     pub fn new() -> Self {
         Self {
             state: UnsafeCell::new(State::None),
@@ -482,18 +505,18 @@ impl<T: Sized> Signal<T> {
     }
 
     fn critical_section<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce() -> R,
+        where
+            F: FnOnce() -> R,
     {
         let guard = self.lock.lock().unwrap();
         f()
     }
 
     #[allow(clippy::single_match)]
-    pub fn signal(&self, val: T) {
+    pub fn signal(&self) {
         self.critical_section(|| unsafe {
             let state = &mut *self.state.get();
-            match mem::replace(state, State::Signaled(val)) {
+            match mem::replace(state, State::Signaled) {
                 State::Waiting(waker) => waker.wake(),
                 _ => {}
             }
@@ -507,7 +530,7 @@ impl<T: Sized> Signal<T> {
         })
     }
 
-    pub fn poll_wait(&self, cx: &mut Context<'_>) -> Poll<T> {
+    pub fn poll_wait(&self, cx: &mut Context<'_>) -> Poll<()> {
         self.critical_section(|| unsafe {
             let state = &mut *self.state.get();
             match state {
@@ -517,8 +540,8 @@ impl<T: Sized> Signal<T> {
                 }
                 State::Waiting(w) if w.will_wake(cx.waker()) => Poll::Pending,
                 State::Waiting(_) => Poll::Pending,
-                State::Signaled(_) => match mem::replace(state, State::None) {
-                    State::Signaled(res) => Poll::Ready(res),
+                State::Signaled => match mem::replace(state, State::None) {
+                    State::Signaled => Poll::Ready(()),
                     _ => Poll::Pending,
                 },
             }
@@ -526,11 +549,11 @@ impl<T: Sized> Signal<T> {
     }
 
     pub fn signaled(&self) -> bool {
-        self.critical_section(|| matches!(unsafe { &*self.state.get() }, State::Signaled(_)))
+        self.critical_section(|| matches!(unsafe { &*self.state.get() }, State::Signaled))
     }
 }
 
-impl<T: Sized> Default for Signal<T> {
+impl Default for Signal {
     fn default() -> Self {
         Self::new()
     }
