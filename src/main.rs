@@ -1,5 +1,7 @@
 use core::cell::{RefCell, UnsafeCell};
+use core::fmt::Debug;
 use core::future::Future;
+use core::mem;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -10,7 +12,17 @@ use heapless::{
     Vec,
 };
 
-trait ActorMessage {}
+struct ActorMessage<A: Actor> {
+    signal: Signal<A::Response>,
+    request: A::Request,
+}
+
+impl<A: Actor> ActorMessage<A> {
+    pub fn new(request: A::Request, signal: Signal<A::Response>) -> Self {
+        Self { request, signal }
+    }
+}
+
 /*
 {
     fn into(self) -> Self;
@@ -21,8 +33,8 @@ use std::sync::Mutex;
 
 trait Actor: Sized {
     type Configuration;
-    type Request;
-    type Response;
+    type Request: Debug;
+    type Response: Debug;
 
     fn mount(&mut self, _: Self::Configuration);
     fn poll_request(
@@ -33,12 +45,8 @@ trait Actor: Sized {
 }
 
 struct ActorContext<A: Actor> {
-    request_producer: RefCell<Option<Producer<'static, A::Request, consts::U2>>>,
-    request_consumer: RefCell<Option<Consumer<'static, A::Request, consts::U2>>>,
-
-    response_producer: RefCell<Option<Producer<'static, A::Response, consts::U2>>>,
-    response_consumer: RefCell<Option<Consumer<'static, A::Response, consts::U2>>>,
-    waker: Mutex<Option<Waker>>,
+    request_producer: RefCell<Option<Producer<'static, ActorMessage<A>, consts::U2>>>,
+    request_consumer: RefCell<Option<Consumer<'static, ActorMessage<A>, consts::U2>>>,
 }
 
 impl<A: Actor> ActorContext<A> {
@@ -46,35 +54,22 @@ impl<A: Actor> ActorContext<A> {
         Self {
             request_producer: RefCell::new(None),
             request_consumer: RefCell::new(None),
-
-            response_producer: RefCell::new(None),
-            response_consumer: RefCell::new(None),
-
-            waker: Mutex::new(None),
         }
     }
 
     fn mount(
         &self,
         req: (
-            Producer<'static, A::Request, consts::U2>,
-            Consumer<'static, A::Request, consts::U2>,
-        ),
-        res: (
-            Producer<'static, A::Response, consts::U2>,
-            Consumer<'static, A::Response, consts::U2>,
+            Producer<'static, ActorMessage<A>, consts::U2>,
+            Consumer<'static, ActorMessage<A>, consts::U2>,
         ),
     ) {
         let (reqp, reqc) = req;
-        let (resp, resc) = res;
         self.request_producer.borrow_mut().replace(reqp);
         self.request_consumer.borrow_mut().replace(reqc);
-
-        self.response_producer.borrow_mut().replace(resp);
-        self.response_consumer.borrow_mut().replace(resc);
     }
 
-    fn next_request(&self) -> Option<A::Request> {
+    fn next_request(&self) -> Option<ActorMessage<A>> {
         self.request_consumer
             .borrow_mut()
             .as_mut()
@@ -82,52 +77,12 @@ impl<A: Actor> ActorContext<A> {
             .dequeue()
     }
 
-    fn enqueue_request(&self, request: A::Request) {
+    fn enqueue_request(&self, request: ActorMessage<A>) {
         self.request_producer
             .borrow_mut()
             .as_mut()
             .unwrap()
             .enqueue(request);
-    }
-
-    fn enqueue_response(&self, request: A::Response) {
-        self.response_producer
-            .borrow_mut()
-            .as_mut()
-            .unwrap()
-            .enqueue(request);
-        self.notify_waker();
-    }
-
-    fn notify_waker(&self) {
-        let mut w = self.waker.lock().unwrap();
-        if let Some(w) = w.take() {
-            println!("Notifying waker");
-            w.wake();
-        }
-    }
-
-    fn set_waker(&self, waker: Waker) {
-        print!("Setting waker");
-        let mut w = self.waker.lock().unwrap();
-        w.replace(waker);
-    }
-
-    fn poll_response(&self, cx: &mut Context<'_>) -> Poll<A::Response> {
-        if let Some(response) = self
-            .response_consumer
-            .borrow_mut()
-            .as_mut()
-            .unwrap()
-            .dequeue()
-        {
-            println!("Poll response yay");
-            Poll::Ready(response)
-        } else {
-            println!("Poll response wait");
-            self.set_waker(cx.waker().clone());
-            Poll::Pending
-        }
     }
 }
 
@@ -138,8 +93,7 @@ struct ActorRunner<A: Actor + 'static> {
     state: AtomicU8,
     in_flight: AtomicBool,
 
-    requests: UnsafeCell<Queue<A::Request, consts::U2>>,
-    responses: UnsafeCell<Queue<A::Response, consts::U2>>,
+    requests: UnsafeCell<Queue<ActorMessage<A>, consts::U2>>,
 
     context: ActorContext<A>,
 }
@@ -153,7 +107,6 @@ impl<A: Actor> ActorRunner<A> {
             in_flight: AtomicBool::new(false),
 
             requests: UnsafeCell::new(Queue::new()),
-            responses: UnsafeCell::new(Queue::new()),
 
             context: ActorContext::new(),
         }
@@ -162,9 +115,8 @@ impl<A: Actor> ActorRunner<A> {
     pub fn mount(&'static self, config: A::Configuration, executor: &mut ActorExecutor) {
         executor.activate_actor(self);
         let req = unsafe { (&mut *self.requests.get()).split() };
-        let res = unsafe { (&mut *self.responses.get()).split() };
 
-        self.context.mount(req, res);
+        self.context.mount(req);
 
         self.actor.borrow_mut().as_mut().unwrap().mount(config);
     }
@@ -178,9 +130,11 @@ impl<A: Actor> ActorRunner<A> {
     }
 
     fn do_request(&'static self, request: A::Request) -> ActorResponseFuture<A> {
-        self.context.enqueue_request(request);
+        let signal = Signal::new();
+        let message = ActorMessage::new(request, signal);
+        self.context.enqueue_request(message);
         self.state.store(ActorState::READY.into(), Ordering::SeqCst);
-        ActorResponseFuture::new(&self.context)
+        ActorResponseFuture::new(signal)
     }
 }
 
@@ -209,12 +163,12 @@ impl<A: Actor> Address<A> {
 }
 
 struct ActorResponseFuture<A: Actor + 'static> {
-    context: &'static ActorContext<A>,
+    signal: Signal<A::Response>,
 }
 
 impl<A: Actor> ActorResponseFuture<A> {
-    pub fn new(context: &'static ActorContext<A>) -> Self {
-        Self { context }
+    pub fn new(signal: Signal<A::Response>) -> Self {
+        Self { signal }
     }
 }
 
@@ -222,7 +176,7 @@ impl<A: Actor> Future for ActorResponseFuture<A> {
     type Output = A::Response;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.context.poll_response(cx)
+        self.signal.poll_wait(cx)
     }
 }
 
@@ -252,11 +206,11 @@ impl<A: Actor> ActiveActor for ActorRunner<A> {
                 let waker = unsafe { Waker::from_raw(raw_waker) };
                 let mut cx = Context::from_waker(&waker);
 
+                println!("Polling future");
                 let item = Pin::new(item);
                 let result = item.poll(&mut cx);
                 match result {
-                    Poll::Ready(value) => {
-                        self.context.enqueue_response(value);
+                    Poll::Ready(_) => {
                         should_drop = true;
                     }
                     Poll::Pending => {
@@ -277,28 +231,36 @@ impl<A: Actor> ActiveActor for ActorRunner<A> {
 
 struct ActorRequestFuture<A: Actor + 'static> {
     runner: &'static ActorRunner<A>,
-    request: A::Request,
+    message: ActorMessage<A>,
 }
 
 impl<A: Actor> Unpin for ActorRequestFuture<A> {}
 unsafe impl Send for Supervised {}
 
 impl<A: Actor> ActorRequestFuture<A> {
-    pub fn new(runner: &'static ActorRunner<A>, request: A::Request) -> Self {
-        Self { runner, request }
+    pub fn new(runner: &'static ActorRunner<A>, message: ActorMessage<A>) -> Self {
+        Self { runner, message }
     }
 }
 
 impl<A: Actor> Future for ActorRequestFuture<A> {
-    type Output = A::Response;
+    type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.runner
+        match self
+            .runner
             .actor
             .borrow_mut()
             .as_mut()
             .unwrap()
-            .poll_request(&self.request, cx)
+            .poll_request(&self.message.request, cx)
+        {
+            Poll::Ready(value) => {
+                self.message.signal.signal(value);
+                Poll::Ready(())
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -402,7 +364,7 @@ fn main() {
         unsafe { core::mem::transmute::<_, &'static ActorRunner<MyActor>>(&bar_runner) };
 
     let foo_addr = Address::new(foo_runner);
-    let bar_addr = Address::new(foo_runner);
+    let bar_addr = Address::new(bar_runner);
     foo_runner.mount(bar_addr, &mut executor);
     bar_runner.mount(foo_addr, &mut executor);
 
@@ -442,6 +404,83 @@ impl Actor for MyActor {
         cx: &mut Context<'_>,
     ) -> Poll<Self::Response> {
         println!("[{}] processing request: {}", self.name, request);
-        Poll::Ready(*request)
+        Poll::Ready(*request + 1)
+    }
+}
+
+pub struct Signal<T> {
+    state: UnsafeCell<State<T>>,
+    lock: std::sync::Mutex<()>,
+}
+
+enum State<T> {
+    None,
+    Waiting(Waker),
+    Signaled(T),
+}
+
+unsafe impl<T: Sized> Send for Signal<T> {}
+unsafe impl<T: Sized> Sync for Signal<T> {}
+
+impl<T: Sized> Signal<T> {
+    pub fn new() -> Self {
+        Self {
+            state: UnsafeCell::new(State::None),
+            lock: std::sync::Mutex::new(()),
+        }
+    }
+
+    fn critical_section<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let guard = self.lock.lock().unwrap();
+        f()
+    }
+
+    #[allow(clippy::single_match)]
+    pub fn signal(&self, val: T) {
+        self.critical_section(|| unsafe {
+            let state = &mut *self.state.get();
+            match mem::replace(state, State::Signaled(val)) {
+                State::Waiting(waker) => waker.wake(),
+                _ => {}
+            }
+        })
+    }
+
+    pub fn reset(&self) {
+        self.critical_section(|| unsafe {
+            let state = &mut *self.state.get();
+            *state = State::None
+        })
+    }
+
+    pub fn poll_wait(&self, cx: &mut Context<'_>) -> Poll<T> {
+        self.critical_section(|| unsafe {
+            let state = &mut *self.state.get();
+            match state {
+                State::None => {
+                    *state = State::Waiting(cx.waker().clone());
+                    Poll::Pending
+                }
+                State::Waiting(w) if w.will_wake(cx.waker()) => Poll::Pending,
+                State::Waiting(_) => Poll::Pending,
+                State::Signaled(_) => match mem::replace(state, State::None) {
+                    State::Signaled(res) => Poll::Ready(res),
+                    _ => Poll::Pending,
+                },
+            }
+        })
+    }
+
+    pub fn signaled(&self) -> bool {
+        self.critical_section(|| matches!(unsafe { &*self.state.get() }, State::Signaled(_)))
+    }
+}
+
+impl<T: Sized> Default for Signal<T> {
+    fn default() -> Self {
+        Self::new()
     }
 }
