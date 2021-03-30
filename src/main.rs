@@ -3,6 +3,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use futures::executor::block_on;
 use heapless::{
     consts,
     spsc::{Consumer, Producer, Queue},
@@ -90,7 +91,6 @@ impl<A: Actor> ActorContext<A> {
     }
 
     fn enqueue_response(&self, request: A::Response) {
-        println!("Enqueueing response");
         self.response_producer
             .borrow_mut()
             .as_mut()
@@ -133,7 +133,7 @@ impl<A: Actor> ActorContext<A> {
 
 struct ActorRunner<A: Actor + 'static> {
     actor: RefCell<Option<A>>,
-    current: RefCell<Option<ActorFuture<A>>>,
+    current: RefCell<Option<ActorRequestFuture<A>>>,
 
     state: AtomicU8,
     in_flight: AtomicBool,
@@ -177,14 +177,14 @@ impl<A: Actor> ActorRunner<A> {
         self.state.fetch_sub(1, Ordering::Acquire);
     }
 
-    fn do_request(&'static self, request: A::Request) -> ActorResponse<A> {
+    fn do_request(&'static self, request: A::Request) -> ActorResponseFuture<A> {
         self.context.enqueue_request(request);
         self.state.store(ActorState::READY.into(), Ordering::SeqCst);
-        ActorResponse::new(&self.context)
+        ActorResponseFuture::new(&self.context)
     }
 }
 
-struct Address<A: Actor> {
+struct Address<A: Actor + 'static> {
     runner: &'static ActorRunner<A>,
 }
 
@@ -198,7 +198,7 @@ impl<A: Actor> Clone for Address<A> {
     }
 }
 
-impl<A: Actor> Address {
+impl<A: Actor> Address<A> {
     fn new(runner: &'static ActorRunner<A>) -> Self {
         Self { runner }
     }
@@ -208,21 +208,27 @@ impl<A: Actor> Address {
     }
 }
 
-struct ActorResponse<A: Actor + 'static> {
+struct ActorResponseFuture<A: Actor + 'static> {
     context: &'static ActorContext<A>,
 }
 
-impl<A: Actor> ActorResponse<A> {
+impl<A: Actor> ActorResponseFuture<A> {
     pub fn new(context: &'static ActorContext<A>) -> Self {
         Self { context }
     }
 }
 
+impl<A: Actor> Future for ActorResponseFuture<A> {
+    type Output = A::Response;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.context.poll_response(cx)
+    }
+}
+
 impl<A: Actor> ActiveActor for ActorRunner<A> {
     fn is_ready(&self) -> bool {
-        let b = self.state.load(Ordering::Acquire) >= ActorState::READY as u8;
-        println!("Is ready: {}", b);
-        b
+        self.state.load(Ordering::Acquire) >= ActorState::READY as u8
     }
 
     fn do_poll(&'static self) {
@@ -232,7 +238,7 @@ impl<A: Actor> ActiveActor for ActorRunner<A> {
                 if let Some(next) = self.context.next_request() {
                     self.current
                         .borrow_mut()
-                        .replace(ActorFuture::new(self, next));
+                        .replace(ActorRequestFuture::new(self, next));
                     self.in_flight.store(true, Ordering::Release);
                 } else {
                     self.in_flight.store(false, Ordering::Release);
@@ -269,21 +275,21 @@ impl<A: Actor> ActiveActor for ActorRunner<A> {
     }
 }
 
-struct ActorFuture<A: Actor + 'static> {
+struct ActorRequestFuture<A: Actor + 'static> {
     runner: &'static ActorRunner<A>,
     request: A::Request,
 }
 
-impl<A: Actor> Unpin for ActorFuture<A> {}
+impl<A: Actor> Unpin for ActorRequestFuture<A> {}
 unsafe impl Send for Supervised {}
 
-impl<A: Actor> ActorFuture<A> {
+impl<A: Actor> ActorRequestFuture<A> {
     pub fn new(runner: &'static ActorRunner<A>, request: A::Request) -> Self {
         Self { runner, request }
     }
 }
 
-impl<A: Actor> Future for ActorFuture<A> {
+impl<A: Actor> Future for ActorRequestFuture<A> {
     type Output = A::Response;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -395,33 +401,38 @@ fn main() {
     let bar_runner =
         unsafe { core::mem::transmute::<_, &'static ActorRunner<MyActor>>(&bar_runner) };
 
-    foo_runner.mount((), &mut executor);
-    bar_runner.mount((), &mut executor);
-
-    let f1 = foo_runner.do_request(1);
-    let f2 = bar_runner.do_request(2);
+    let foo_addr = Address::new(foo_runner);
+    let bar_addr = Address::new(foo_runner);
+    foo_runner.mount(bar_addr, &mut executor);
+    bar_runner.mount(foo_addr, &mut executor);
 
     std::thread::spawn(move || {
         executor.run_forever();
     });
+
+    // Cheat and use other executor for the test
+    println!("Foo result: {}", block_on(foo_addr.request(1)));
+    println!("Bar result: {}", block_on(bar_addr.request(2)));
 }
 
 struct MyActor {
     name: &'static str,
+    other: Option<Address<MyActor>>,
 }
 
 impl MyActor {
     pub fn new(name: &'static str) -> Self {
-        Self { name }
+        Self { name, other: None }
     }
 }
 
 impl Actor for MyActor {
     type Request = u8;
     type Response = u8;
-    type Configuration = ();
+    type Configuration = Address<MyActor>;
 
     fn mount(&mut self, config: Self::Configuration) {
+        self.other.replace(config);
         println!("[{}] mounted!", self.name);
     }
 
