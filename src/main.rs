@@ -127,7 +127,8 @@ impl<A: Actor> ActorContext<A> {
 
 struct ActorRunner<A: Actor + 'static> {
     actor: RefCell<Option<A>>,
-    current: RefCell<Option<ActorRequestFuture<A>>>,
+    //current: RefCell<Option<ActorRequestFuture<A>>>,
+    current: RefCell<Option<ActorMessage<A>>>,
 
     state: AtomicU8,
     in_flight: AtomicBool,
@@ -243,84 +244,38 @@ impl<A: Actor> ActiveActor for ActorRunner<A> {
     }
 
     fn do_poll(&'static self) {
-        println!("Running self");
-        loop {
-            if self.current.borrow().is_none() {
-                if let Some(next) = self.context.next_message() {
-                    self.current
-                        .borrow_mut()
-                        .replace(ActorRequestFuture::new(self, next));
-                    self.in_flight.store(true, Ordering::Release);
-                } else {
-                    self.in_flight.store(false, Ordering::Release);
-                }
-            }
-
-            let should_drop;
-            if let Some(item) = &mut *self.current.borrow_mut() {
-                let state_flag_handle = &self.state as *const _ as *const ();
-                let raw_waker = RawWaker::new(state_flag_handle, &VTABLE);
-                let waker = unsafe { Waker::from_raw(raw_waker) };
-                let mut cx = Context::from_waker(&waker);
-
-                println!("Polling future");
-                let item = Pin::new(item);
-                let result = item.poll(&mut cx);
-                match result {
-                    Poll::Ready(_) => {
-                        should_drop = true;
-                    }
-                    Poll::Pending => {
-                        break;
-                    }
-                }
+        println!("[ActiveActor] do_poll()");
+        if self.current.borrow().is_none() {
+            if let Some(next) = self.context.next_message() {
+                self.current
+                    .borrow_mut()
+                    .replace(next);
+                self.in_flight.store(true, Ordering::Release);
             } else {
-                break;
-            }
-
-            if should_drop {
-                let _ = self.current.borrow_mut().take().unwrap();
+                self.in_flight.store(false, Ordering::Release);
             }
         }
+
+        if let Some(item) = &mut *self.current.borrow_mut() {
+            let state_flag_handle = &self.state as *const _ as *const ();
+            let raw_waker = RawWaker::new(state_flag_handle, &VTABLE);
+            let waker = unsafe { Waker::from_raw(raw_waker) };
+            let mut cx = Context::from_waker(&waker);
+
+            let mut actor = self.actor.borrow_mut();
+            let mut actor = actor.as_mut().unwrap();
+            if let Poll::Ready(_) = actor.poll_message(unsafe { &mut **item.inner.get_mut() }, &mut cx) {
+                unsafe { &**item.signal.get() }.signal();
+            }
+        }
+
         self.decrement_ready();
+        println!(" and done {}", self.is_ready());
     }
 }
-
-struct ActorRequestFuture<A: Actor + 'static> {
-    runner: &'static ActorRunner<A>,
-    message: ActorMessage<A>,
-}
-
-impl<A: Actor> Unpin for ActorRequestFuture<A> {}
 
 unsafe impl Send for Supervised {}
 
-impl<A: Actor> ActorRequestFuture<A> {
-    pub fn new(runner: &'static ActorRunner<A>, message: ActorMessage<A>) -> Self {
-        Self { runner, message }
-    }
-}
-
-impl<A: Actor> Future for ActorRequestFuture<A> {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self
-            .runner
-            .actor
-            .borrow_mut()
-            .as_mut()
-            .unwrap()
-            .poll_message(unsafe { &mut **self.message.inner.get() }, cx)
-        {
-            Poll::Ready(()) => {
-                unsafe { &**self.message.signal.get() }.signal();
-                Poll::Ready(())
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
 
 pub struct ActorExecutor {
     actors: Vec<Supervised, consts::U16>,
@@ -430,14 +385,18 @@ fn main() {
         executor.run_forever();
     });
 
-    let mut foo_req = MyMessage::new(1, 2, 5);
-    let mut bar_req = MyMessage::new(3, 4, 5);
+    let mut foo_req = MyMessage::new(1, 2, 2);
+    let mut bar_req = MyMessage::new(3, 4, 2);
 
     let foo_fut = foo_addr.process(&mut foo_req);
     let bar_fut = bar_addr.process(&mut bar_req);
 
+    println!("block on foo");
     block_on(foo_fut);
+    println!("complete foo");
+    println!("block on bar");
     block_on(bar_fut);
+    println!("complete bar");
     // Cheat and use other executor for the test
     println!("Foo result: {:?}", foo_req);
     println!("Bar result: {:?}", bar_req);
