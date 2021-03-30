@@ -14,12 +14,12 @@ use heapless::{
 
 struct ActorMessage<A: Actor + 'static> {
     signal: &'static SignalSlot,
-    request: UnsafeCell<* mut A::Request>,
+    inner: UnsafeCell<* mut A::Message>,
 }
 
 impl<A: Actor> ActorMessage<A> {
-    pub fn new(request: &mut A::Request, signal: &'static SignalSlot) -> Self {
-        Self { request: UnsafeCell::new(request), signal }
+    pub fn new(message: &mut A::Message, signal: &'static SignalSlot) -> Self {
+        Self { inner: UnsafeCell::new(message), signal }
     }
 }
 
@@ -67,29 +67,30 @@ impl Default for SignalSlot {
 }*/
 
 use std::sync::Mutex;
+use std::time::{SystemTime, Duration};
 
 trait Actor: Sized {
     type Configuration;
-    type Request: Debug;
+    type Message: Debug;
 
     fn mount(&mut self, _: Self::Configuration);
-    fn poll_request(
+    fn poll_message(
         &mut self,
-        request: &mut Self::Request,
+        message: &mut Self::Message,
         cx: &mut Context<'_>,
     ) -> Poll<()>;
 }
 
 struct ActorContext<A: Actor + 'static> {
-    request_producer: RefCell<Option<Producer<'static, ActorMessage<A>, consts::U2>>>,
-    request_consumer: RefCell<Option<Consumer<'static, ActorMessage<A>, consts::U2>>>,
+    message_producer: RefCell<Option<Producer<'static, ActorMessage<A>, consts::U2>>>,
+    message_consumer: RefCell<Option<Consumer<'static, ActorMessage<A>, consts::U2>>>,
 }
 
 impl<A: Actor> ActorContext<A> {
     pub fn new() -> Self {
         Self {
-            request_producer: RefCell::new(None),
-            request_consumer: RefCell::new(None),
+            message_producer: RefCell::new(None),
+            message_consumer: RefCell::new(None),
         }
     }
 
@@ -101,24 +102,24 @@ impl<A: Actor> ActorContext<A> {
         ),
     ) {
         let (reqp, reqc) = req;
-        self.request_producer.borrow_mut().replace(reqp);
-        self.request_consumer.borrow_mut().replace(reqc);
+        self.message_producer.borrow_mut().replace(reqp);
+        self.message_consumer.borrow_mut().replace(reqc);
     }
 
-    fn next_request(&self) -> Option<ActorMessage<A>> {
-        self.request_consumer
+    fn next_message(&self) -> Option<ActorMessage<A>> {
+        self.message_consumer
             .borrow_mut()
             .as_mut()
             .unwrap()
             .dequeue()
     }
 
-    fn enqueue_request(&self, request: ActorMessage<A>) {
-        self.request_producer
+    fn enqueue_message(&self, message: ActorMessage<A>) {
+        self.message_producer
             .borrow_mut()
             .as_mut()
             .unwrap()
-            .enqueue(request);
+            .enqueue(message);
     }
 }
 
@@ -130,7 +131,7 @@ struct ActorRunner<A: Actor + 'static> {
     in_flight: AtomicBool,
 
     signals: UnsafeCell<[SignalSlot; 2]>,
-    requests: UnsafeCell<Queue<ActorMessage<A>, consts::U2>>,
+    messages: UnsafeCell<Queue<ActorMessage<A>, consts::U2>>,
 
     context: ActorContext<A>,
 }
@@ -144,7 +145,7 @@ impl<A: Actor> ActorRunner<A> {
             in_flight: AtomicBool::new(false),
             signals: UnsafeCell::new(Default::default()),
 
-            requests: UnsafeCell::new(Queue::new()),
+            messages: UnsafeCell::new(Queue::new()),
 
             context: ActorContext::new(),
         }
@@ -152,7 +153,7 @@ impl<A: Actor> ActorRunner<A> {
 
     pub fn mount(&'static self, config: A::Configuration, executor: &mut ActorExecutor) {
         executor.activate_actor(self);
-        let req = unsafe { (&mut *self.requests.get()).split() };
+        let req = unsafe { (&mut *self.messages.get()).split() };
 
         self.context.mount(req);
 
@@ -179,10 +180,10 @@ impl<A: Actor> ActorRunner<A> {
         panic!("not enough signals!");
     }
 
-    fn do_request(&'static self, request: &mut A::Request) -> ActorResponseFuture {
+    fn process_message(&'static self, message: &mut A::Message) -> ActorResponseFuture {
         let signal = self.acquire_signal();
-        let message = ActorMessage::new(request, signal);
-        self.context.enqueue_request(message);
+        let message = ActorMessage::new(message, signal);
+        self.context.enqueue_message(message);
         self.state.store(ActorState::READY.into(), Ordering::SeqCst);
         ActorResponseFuture::new(signal)
     }
@@ -207,8 +208,8 @@ impl<A: Actor> Address<A> {
         Self { runner }
     }
 
-    async fn request(&self, request: &mut A::Request) {
-        self.runner.do_request(request).await
+    async fn process(&self, message: &mut A::Message) {
+        self.runner.process_message(message).await
     }
 }
 
@@ -239,7 +240,7 @@ impl<A: Actor> ActiveActor for ActorRunner<A> {
         println!("Running self");
         loop {
             if self.current.borrow().is_none() {
-                if let Some(next) = self.context.next_request() {
+                if let Some(next) = self.context.next_message() {
                     self.current
                         .borrow_mut()
                         .replace(ActorRequestFuture::new(self, next));
@@ -304,7 +305,7 @@ impl<A: Actor> Future for ActorRequestFuture<A> {
             .borrow_mut()
             .as_mut()
             .unwrap()
-            .poll_request(unsafe { &mut **self.message.request.get() }, cx)
+            .poll_message(unsafe { &mut **self.message.inner.get() }, cx)
         {
             Poll::Ready(()) => {
                 self.message.signal.signal();
@@ -423,11 +424,14 @@ fn main() {
         executor.run_forever();
     });
 
-    let mut foo_req = MyRequest::new(1, 2);
-    let mut bar_req = MyRequest::new(3, 4);
+    let mut foo_req = MyMessage::new(1, 2, 5);
+    let mut bar_req = MyMessage::new(3, 4, 5);
 
-    block_on(foo_addr.request(&mut foo_req));
-    block_on(bar_addr.request(&mut bar_req));
+    let foo_fut = foo_addr.process(&mut foo_req);
+    let bar_fut = bar_addr.process(&mut bar_req);
+
+    block_on(foo_fut );
+    block_on(bar_fut );
     // Cheat and use other executor for the test
     println!("Foo result: {:?}", foo_req);
     println!("Bar result: {:?}", bar_req);
@@ -445,24 +449,28 @@ impl MyActor {
 }
 
 #[derive(Debug)]
-pub struct MyRequest {
-    pub a: u8,
-    pub b: u8,
-    pub c: Option<u8>,
+pub struct MyMessage {
+    a: u8,
+    b: u8,
+    delay: u8,
+    started_at: Option<SystemTime>,
+    c: Option<u8>,
 }
 
-impl MyRequest {
-    pub fn new(a: u8, b: u8) -> Self {
+impl MyMessage {
+    pub fn new(a: u8, b: u8, delay: u8) -> Self {
         Self {
             a,
             b,
+            delay,
+            started_at: None,
             c: None,
         }
     }
 }
 
 impl Actor for MyActor {
-    type Request = MyRequest;
+    type Message = MyMessage;
     type Configuration = Address<MyActor>;
 
     fn mount(&mut self, config: Self::Configuration) {
@@ -470,14 +478,38 @@ impl Actor for MyActor {
         println!("[{}] mounted!", self.name);
     }
 
-    fn poll_request(
+    fn poll_message(
         &mut self,
-        request: &mut Self::Request,
+        message: &mut Self::Message,
         cx: &mut Context<'_>,
     ) -> Poll<()> {
-        println!("[{}] processing request: {:?}", self.name, request);
-        request.c.replace( request.a + request.b );
-        Poll::Ready(())
+        match message.started_at {
+            None => {
+                println!("[{}] delaying request: {:?}", self.name, message);
+                message.started_at.replace( SystemTime::now() );
+                let waker = cx.waker().clone();
+                let delay = message.delay;
+                let name = self.name;
+                std::thread::spawn( move || {
+                    println!("[{}] sleeping for {}", name, delay);
+                    std::thread::sleep( Duration::from_secs( delay as u64) );
+                    println!("[{}] waking for {}", name, delay);
+                    waker.wake();
+                });
+                Poll::Pending
+            }
+            Some(time) => {
+                if let Ok(elapsed) = time.elapsed() {
+                    println!("[{}] woken after {:?}", self.name, elapsed.as_secs());
+                    if elapsed.as_secs() >= message.delay as u64{
+                        println!("[{}] completed request: {:?}", self.name, message);
+                        return Poll::Ready(())
+                    }
+                }
+                println!("[{}] still pending", self.name);
+                Poll::Pending
+            }
+        }
     }
 }
 
