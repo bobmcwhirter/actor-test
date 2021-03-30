@@ -6,4 +6,5 @@ edition = "2018"
 
 [dependencies]
 heapless = "0.6"
+generic-array = "0.14.4"
 futures = { version = "0.3", features = ["executor"]}

@@ -6,20 +6,16 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use futures::executor::block_on;
-use heapless::{
-    consts,
-    spsc::{Consumer, Producer, Queue},
-    Vec,
-};
+use heapless::{consts, spsc::{Consumer, Producer, Queue}, Vec, ArrayLength};
 
 struct ActorMessage<A: Actor> {
-    signal: UnsafeCell<*const SignalSlot>,
-    inner: UnsafeCell<*mut A::Message>,
+    signal: RefCell<*const SignalSlot>,
+    inner: RefCell<*mut A::Message>,
 }
 
 impl<A: Actor> ActorMessage<A> {
     pub fn new(message: &mut A::Message, signal: &SignalSlot) -> Self {
-        Self { inner: UnsafeCell::new(message), signal: UnsafeCell::new(signal) }
+        Self { inner: RefCell::new(message), signal: RefCell::new(signal) }
     }
 }
 
@@ -69,6 +65,7 @@ impl Default for SignalSlot {
 use std::sync::Mutex;
 use std::time::{SystemTime, Duration};
 use std::marker::PhantomData;
+use generic_array::GenericArray;
 
 trait Actor: Sized {
     type Configuration;
@@ -82,12 +79,13 @@ trait Actor: Sized {
     ) -> Poll<()>;
 }
 
-struct ActorContext<A: Actor> {
-    message_producer: RefCell<Option<Producer<'static, ActorMessage<A>, consts::U2>>>,
-    message_consumer: RefCell<Option<Consumer<'static, ActorMessage<A>, consts::U2>>>,
+
+struct ActorContext<A: Actor, Q: ArrayLength<SignalSlot> + ArrayLength<ActorMessage<A>>> {
+    message_producer: RefCell<Option<Producer<'static, ActorMessage<A>, Q>>>,
+    message_consumer: RefCell<Option<Consumer<'static, ActorMessage<A>, Q>>>,
 }
 
-impl<A: Actor> ActorContext<A> {
+impl<A: Actor, Q: ArrayLength<SignalSlot> + ArrayLength<ActorMessage<A>>> ActorContext<A, Q> {
     pub fn new() -> Self {
         Self {
             message_producer: RefCell::new(None),
@@ -98,8 +96,8 @@ impl<A: Actor> ActorContext<A> {
     fn mount(
         &self,
         req: (
-            Producer<'static, ActorMessage<A>, consts::U2>,
-            Consumer<'static, ActorMessage<A>, consts::U2>,
+            Producer<'static, ActorMessage<A>, Q>,
+            Consumer<'static, ActorMessage<A>, Q>,
         ),
     ) {
         let (reqp, reqc) = req;
@@ -124,20 +122,20 @@ impl<A: Actor> ActorContext<A> {
     }
 }
 
-struct ActorRunner<A: Actor> {
+struct ActorRunner<A: Actor, Q: ArrayLength<SignalSlot> + ArrayLength<ActorMessage<A>>> {
     actor: RefCell<Option<A>>,
     current: RefCell<Option<ActorMessage<A>>>,
 
     state: AtomicU8,
     in_flight: AtomicBool,
 
-    signals: UnsafeCell<[SignalSlot; 2]>,
-    messages: UnsafeCell<Queue<ActorMessage<A>, consts::U2>>,
+    signals: UnsafeCell<GenericArray<SignalSlot, Q>>,
+    messages: UnsafeCell<Queue<ActorMessage<A>, Q>>,
 
-    context: ActorContext<A>,
+    context: ActorContext<A, Q>,
 }
 
-impl<A: Actor> ActorRunner<A> {
+impl<A: Actor, Q: ArrayLength<SignalSlot> + ArrayLength<ActorMessage<A>>> ActorRunner<A, Q> {
     pub fn new(actor: A) -> Self {
         Self {
             actor: RefCell::new(Some(actor)),
@@ -180,7 +178,9 @@ impl<A: Actor> ActorRunner<A> {
         }
         panic!("not enough signals!");
     }
+}
 
+impl<A: Actor,Q: ArrayLength<SignalSlot> + ArrayLength<ActorMessage<A>> > ActorHandle<A> for ActorRunner<A, Q> {
     fn process_message<'s, 'm>(&'s self, message: &'m mut A::Message) -> ActorResponseFuture<'s, 'm> {
         let signal = self.acquire_signal();
         let message = ActorMessage::new(message, signal);
@@ -190,8 +190,12 @@ impl<A: Actor> ActorRunner<A> {
     }
 }
 
+trait ActorHandle<A: Actor> {
+    fn process_message<'s, 'm>(&'s self, message: &'m mut A::Message) -> ActorResponseFuture<'s, 'm>;
+}
+
 struct Address<'a, A: Actor> {
-    runner: &'a ActorRunner<A>,
+    runner: &'a dyn ActorHandle<A>,
 }
 
 impl<A: Actor> Copy for Address<'_, A> {}
@@ -205,7 +209,7 @@ impl<A: Actor> Clone for Address<'_, A> {
 }
 
 impl<'a, A: Actor> Address<'a, A> {
-    fn new(runner: &'a ActorRunner<A>) -> Self {
+    fn new(runner: &'a dyn ActorHandle<A>) -> Self {
         Self { runner }
     }
 
@@ -236,7 +240,7 @@ impl Future for ActorResponseFuture<'_, '_> {
     }
 }
 
-impl<A: Actor> ActiveActor for ActorRunner<A> {
+impl<A: Actor, Q: ArrayLength<SignalSlot> + ArrayLength<ActorMessage<A>>> ActiveActor for ActorRunner<A, Q> {
     fn is_ready(&self) -> bool {
         self.state.load(Ordering::Acquire) >= ActorState::READY as u8
     }
@@ -263,7 +267,7 @@ impl<A: Actor> ActiveActor for ActorRunner<A> {
             let mut actor = self.actor.borrow_mut();
             let mut actor = actor.as_mut().unwrap();
             if let Poll::Ready(_) = actor.poll_message(unsafe { &mut **item.inner.get_mut() }, &mut cx) {
-                unsafe { &**item.signal.get() }.signal();
+                unsafe { &**item.signal.borrow() }.signal()
             }
         }
 
@@ -300,7 +304,7 @@ trait ActiveActor {
 }
 
 impl<'a> Supervised<'a> {
-    fn new<A: Actor>(actor: &'a ActorRunner<A>) -> Self {
+    fn new<A: Actor, Q: ArrayLength<SignalSlot> + ArrayLength<ActorMessage<A>>>(actor: &'a ActorRunner<A, Q>) -> Self {
         Self { actor }
     }
 
@@ -319,7 +323,7 @@ impl<'a> ActorExecutor<'a> {
         Self { actors: Vec::new() }
     }
 
-    pub(crate) fn activate_actor<A: Actor>(&mut self, actor: &'a ActorRunner<A>) {
+    pub(crate) fn activate_actor<A: Actor, Q: ArrayLength<SignalSlot> + ArrayLength<ActorMessage<A>>>(&mut self, actor: &'a ActorRunner<A, Q>) {
         let supervised = Supervised::new(actor);
         self.actors
             .push(supervised)
@@ -363,18 +367,21 @@ static VTABLE: RawWakerVTable = {
     RawWakerVTable::new(clone, wake, wake_by_ref, drop)
 };
 
+// Completely and totally not safe.
+fn staticize<A: Actor, Q: ArrayLength<SignalSlot> + ArrayLength<ActorMessage<A>>>(runner: &ActorRunner<A,Q>) -> &'static ActorRunner<A,Q> {
+    unsafe {
+        unsafe { core::mem::transmute::<_, &'static ActorRunner<A, Q>>(runner) }
+    }
+}
+
 fn main() {
     let mut executor = ActorExecutor::new();
-    let foo_runner = ActorRunner::new(MyActor::new("foo"));
-    let bar_runner = ActorRunner::new(MyActor::new("bar"));
-
-    let foo_runner =
-        unsafe { core::mem::transmute::<_, &'static ActorRunner<MyActor>>(&foo_runner) };
-    let bar_runner =
-        unsafe { core::mem::transmute::<_, &'static ActorRunner<MyActor>>(&bar_runner) };
+    let foo_runner = staticize(&ActorRunner::<_, consts::U4>::new(MyActor::new("foo")));
+    let bar_runner = staticize(&ActorRunner::<_, consts::U4>::new(MyActor::new("bar")));
 
     let foo_addr = Address::new(foo_runner);
     let bar_addr = Address::new(bar_runner);
+
     foo_runner.mount(bar_addr, &mut executor);
     bar_runner.mount(foo_addr, &mut executor);
 
